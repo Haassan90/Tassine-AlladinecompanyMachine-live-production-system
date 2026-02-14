@@ -45,7 +45,11 @@ from scheduler import start_scheduler  # Scheduler with WebSocket manager
 # =====================================================
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("production_system.log"),
+        logging.StreamHandler()
+    ]
 )
 
 # =====================================================
@@ -53,11 +57,13 @@ logging.basicConfig(
 # =====================================================
 app = FastAPI(title="Taco Group Live Production")
 
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://127.0.0.1:8000").split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -106,12 +112,15 @@ class ConnectionManager:
             self.active_connections.remove(ws)
 
     async def broadcast(self, data: dict):
-        for ws in list(self.active_connections):
+        dead_connections = []
+        for ws in self.active_connections:
             try:
-                await ws.send_json(data)
+                await asyncio.wait_for(ws.send_json(data), timeout=2)
             except Exception:
-                self.disconnect(ws)
+                dead_connections.append(ws)
 
+        for ws in dead_connections:
+            self.disconnect(ws)
 manager = ConnectionManager()
 
 @app.websocket("/ws/dashboard")
@@ -220,111 +229,177 @@ def admin_work_orders():
 # =====================================================
 class MachineAction(BaseModel):
     location: str
-    machine_id: int
+    machine_id: str
 
 class MachineRename(MachineAction):
     new_name: str
 
 # =====================================================
-# Machine Helpers
-# =====================================================
-def get_machine(db: Session, location: str, machine_id: int):
-    return db.query(Machine).filter(Machine.id == machine_id, Machine.location == location).first()
-
 async def update_machine_status(db: Session, m: Machine, new_status: str):
     m.status = new_status
+
     try:
         if new_status == "running":
             m.is_locked = True
             m.last_tick_time = datetime.now(timezone.utc)
-            if ERP_URL and ERP_API_KEY and ERP_API_SECRET:
-                update_work_order_status(m.erpnext_work_order_id, "In Process")
+
+            # Safe ERP update
+            if (
+                ERP_URL 
+                and ERP_API_KEY 
+                and ERP_API_SECRET 
+                and m.erpnext_work_order_id
+            ):
+                update_work_order_status(
+                    m.erpnext_work_order_id, 
+                    "In Process"
+                )
+
         elif new_status == "completed":
             m.is_locked = False
-            if ERP_URL and ERP_API_KEY and ERP_API_SECRET:
-                update_work_order_status(m.erpnext_work_order_id, "Completed")
+
+            # Safe ERP update
+            if (
+                ERP_URL 
+                and ERP_API_KEY 
+                and ERP_API_SECRET 
+                and m.erpnext_work_order_id
+            ):
+                update_work_order_status(
+                    m.erpnext_work_order_id, 
+                    "Completed"
+                )
+
     except Exception as e:
         logging.error(f"ERPNext status update failed: {e}")
+
     db.commit()
 
 # =====================================================
-# API – Machine Controls
+# =====================================================
+# Helper – Get Machine by location and ID
+# =====================================================
+def get_machine(db: Session, location: str, machine_id: str) -> Machine | None:
+    """Fetch a machine by location and ID."""
+    return db.query(Machine).filter(
+        Machine.id == machine_id,
+        Machine.location == location
+    ).first()
+
+# =====================================================
+# API – Machine Controls (Updated)
 # =====================================================
 @app.post("/api/machine/start")
 async def start_machine(data: MachineAction, db: Session = Depends(get_db)):
     m = get_machine(db, data.location, data.machine_id)
     if not m or not m.work_order:
-        return {"ok": False}
+        return {"ok": False, "error": "Machine not found or no active work order"}
     await update_machine_status(db, m, "running")
-    return {"ok": True}
+    return {"ok": True, "machine": {"id": m.id, "status": m.status}}
 
 @app.post("/api/machine/pause")
 async def pause_machine(data: MachineAction, db: Session = Depends(get_db)):
     m = get_machine(db, data.location, data.machine_id)
     if not m:
-        return {"ok": False}
+        return {"ok": False, "error": "Machine not found"}
     m.status = "paused"
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "machine": {"id": m.id, "status": m.status}}
 
 @app.post("/api/machine/stop")
 async def stop_machine(data: MachineAction, db: Session = Depends(get_db)):
     m = get_machine(db, data.location, data.machine_id)
     if not m:
-        return {"ok": False}
+        return {"ok": False, "error": "Machine not found"}
     await update_machine_status(db, m, "stopped")
-    return {"ok": True}
+    return {"ok": True, "machine": {"id": m.id, "status": m.status}}
 
 @app.post("/api/machine/rename")
 async def rename_machine(data: MachineRename, db: Session = Depends(get_db)):
     m = get_machine(db, data.location, data.machine_id)
     if not m:
-        return {"ok": False}
+        return {"ok": False, "error": "Machine not found"}
+    old_name = m.name
     m.name = data.new_name
     db.commit()
-    return {"ok": True}
-
+    return {
+        "ok": True,
+        "machine": {"id": m.id, "old_name": old_name, "new_name": m.name}
+    }
 # =====================================================
 # Automatic Meter Counter
 # =====================================================
+from datetime import datetime, timezone
+
 async def automatic_meter_counter():
     while True:
+        await asyncio.sleep(0.1)
         db = SessionLocal()
         try:
             machines = db.query(Machine).filter(Machine.status == "running").all()
-            now = datetime.now(timezone.utc)
+            now = datetime.now(timezone.utc)  # always UTC-aware
+
             for m in machines:
                 if not m.seconds_per_meter or not m.work_order:
                     continue
-                if not m.last_tick_time:
+
+                # Ensure last_tick_time is set and timezone-aware
+                if m.last_tick_time:
+                    last_tick = m.last_tick_time
+                    if last_tick.tzinfo is None:
+                        last_tick = last_tick.replace(tzinfo=timezone.utc)
+                else:
                     m.last_tick_time = now
                     continue
-                diff = (now - m.last_tick_time).total_seconds()
+
+                # Calculate elapsed ticks
+                diff = (now - last_tick).total_seconds()
                 ticks = int(diff // m.seconds_per_meter)
+
                 if ticks > 0 and m.produced_qty < m.target_qty:
                     increment = min(ticks, m.target_qty - m.produced_qty)
                     m.produced_qty += increment
-                    m.last_tick_time = now
+                    m.last_tick_time = now  # always UTC-aware
+
+                    # Safe values for ProductionLog
+                    location_value = m.location or "Unknown"
+                    remaining_qty = m.target_qty - m.produced_qty
+                    status_value = "running"
+
+                    # Insert production log
                     db.add(ProductionLog(
                         machine_id=m.id,
+                        location=location_value,
                         work_order=m.work_order,
                         pipe_size=m.pipe_size,
                         produced_qty=increment,
+                        remaining_qty=remaining_qty,
+                        status=status_value,
                         timestamp=now
                     ))
-                    meta = db.query(ERPNextMetadata).filter(ERPNextMetadata.work_order == m.work_order).first()
+
+                    # Update ERPNext metadata if exists
+                    meta = db.query(ERPNextMetadata).filter(
+                        ERPNextMetadata.work_order == m.work_order
+                    ).first()
                     if meta:
                         meta.erp_status = "In Progress"
                         meta.last_synced = now
+
+                    # Mark machine as completed if target reached
                     if m.produced_qty >= m.target_qty:
                         m.produced_qty = m.target_qty
                         await update_machine_status(db, m, "completed")
+
             db.commit()
         except Exception as e:
             logging.error(f"AUTO METER ERROR: {e}")
+            db.rollback()
         finally:
             db.close()
+
         await asyncio.sleep(1)
+
 
 # =====================================================
 # Production Alerts
@@ -333,13 +408,14 @@ alert_history = {}
 
 async def production_alerts():
     while True:
+        await asyncio.sleep(0.1)
         db = SessionLocal()
         try:
             machines = db.query(Machine).filter(Machine.target_qty > 0).all()
             for m in machines:
                 if not m.work_order or m.status != "running":
                     continue
-                percent = (m.produced_qty / m.target_qty) * 100
+                percent = (m.produced_qty / m.target_qty) * 100 if m.target_qty else 0
                 last_level = alert_history.get(m.id, 0)
                 alert_level = 0
                 message = None
@@ -369,6 +445,8 @@ async def production_alerts():
 async def erpnext_sync_loop(interval: int = 10):
     logging.info("🚀 ERPNext Sync Loop started")
     while True:
+        await asyncio.sleep(0.1)
+
         try:
             # Safe call: ERP offline will not break loop
             await asyncio.to_thread(auto_assign_work_orders)
@@ -381,6 +459,8 @@ async def erpnext_sync_loop(interval: int = 10):
 # =====================================================
 async def broadcast_dashboard_and_erpnext():
     while True:
+        await asyncio.sleep(0.1)
+
         db = SessionLocal()
         try:
             locations = get_dashboard_data(db)
@@ -420,3 +500,23 @@ async def startup_event():
     
     # Start scheduler with WebSocket manager
     start_scheduler(manager)
+# =====================================================
+# Production Logs API (FIXED)
+# =====================================================
+@app.get("/api/production_logs")
+def production_logs(db: Session = Depends(get_db)):
+    logs = db.query(ProductionLog).order_by(
+        ProductionLog.timestamp.desc()
+    ).limit(200).all()
+
+    return [
+        {
+            "id": log.id,
+            "machine_id": log.machine_id,
+            "work_order": log.work_order,
+            "pipe_size": log.pipe_size,
+            "produced_qty": log.produced_qty,
+            "timestamp": log.timestamp.isoformat() if log.timestamp else None
+        }
+        for log in logs
+    ]
